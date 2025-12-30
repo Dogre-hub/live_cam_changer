@@ -1,0 +1,43 @@
+# setup/config.yaml
+# Edit URLs, paths, repo, and conversion flags here.
+
+git:
+  repo: "https://github.com/yourusername/your-repo.git"   # <-- change this
+  branch: "main"
+  dest: "/workspace/project"                             # where the repo will be cloned/pulled
+
+system:
+  require_gpu: true
+  gpu_check_cmd: "nvidia-smi"
+  trtexec_cmd: "trtexec"         # path to trtexec; adjust if needed
+  trtexec_timeout_sec: 900       # timeout for conversion command
+
+paths:
+  base_dir: "."                        # current folder
+  models_dir: "./models"                # relative to project root
+  onnx_dir: "./models/onnx"
+  trt_dir: "./models/tensorrt"
+  repo_dir: "./project"                 # optional, can be ./src
+
+
+models:
+  - name: "inswapper"
+    type: "onnx"
+    url: "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx?download=true"
+    filename: "inswapper_128_fp16.onnx"
+    convert_to_trt: true
+    trt_filename: "inswapper_128_fp16.trt"
+    trtexec_args: "--fp16 --workspace=2048"
+
+  - name: "GFPGAN"
+    type: "pth"
+    url: "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth"
+    filename: "GFPGANv1.4.pth"
+    convert_to_trt: false
+    trt_filename: ""
+
+actions:
+  run_clone_repo: true
+  run_download_models: true
+  run_convert_trt: true
+  verify_trtexec: true
