@@ -1,0 +1,13 @@
+cat <<EOF >> .gitignore
+models/
+*.pth
+*.onnx
+*.engine
+*.trt
+*.pt
+*.ckpt
+*.bin
+EOF
+
+git add .gitignore
+git commit -m "Ignore model artifacts"
