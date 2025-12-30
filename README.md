@@ -1,8 +1,9 @@
 # live_cam_changer
 change face in real time 
 
-python3 setup/setup.py --no-gpu-check --config setup/config.yaml
+python3 setup/setup.py --no-gpu-check --skip-convert --config setup/config.yaml
 
+check
 project-root/
 ├── setup/
 │   └── setup.py              # manual setup script
