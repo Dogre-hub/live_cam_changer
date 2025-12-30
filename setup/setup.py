@@ -31,6 +31,11 @@ import shutil
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+from pathlib import Path
+from dotenv import load_dotenv
+
+env_path = Path('.') / '.env'
+load_dotenv(dotenv_path=env_path)
 
 try:
     import requests
@@ -279,16 +284,23 @@ def main():
             log("Warning: trtexec not found. You will NOT be able to convert ONNX -> TensorRT until TensorRT is installed.")
             # do not exit; user may still want to download models
 
-    # 3) Git clone / pull
     if cfg.get("actions", {}).get("run_clone_repo", True):
         repo_cfg = cfg.get("git", {})
         repo_url = repo_cfg.get("repo")
         branch = repo_cfg.get("branch", "main")
         dest = cfg["paths"]["repo_dir"]
+
+        # Load PAT from environment
+        GITHUB_PAT = os.getenv("GITHUB_PAT")
+        if GITHUB_PAT and repo_url.startswith("https://github.com/"):
+            # Insert token into HTTPS URL
+            repo_url = repo_url.replace("https://", f"https://{GITHUB_PAT}@")
+            
         if repo_url:
             git_clone_or_pull(repo_url, branch, dest)
         else:
             log("No git repo URL provided in config; skipping clone/pull.")
+
 
     # 4) Download models if missing
     if cfg.get("actions", {}).get("run_download_models", True):
