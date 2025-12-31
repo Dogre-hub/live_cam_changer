@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
-setup/setup.py
+setup/setup.py (improved)
 
-Enhanced idempotent installer for live_cam_changer repo.
-
-- Reads .env and setup/config.yaml
-- Installs missing python packages (requests, tqdm, pyyaml, python-dotenv) automatically
-- Checks GPU (nvidia-smi) and optional CUDA version
-- Installs/unpacks TensorRT from a local tarball (if configured) and wires environment
-- Moves local .onnx/.trt into models/onnx and models/trt (idempotent)
-- Downloads ONNX / PyTorch models (if urls provided)
-- Converts ONNX -> TensorRT using trtexec (streams logs)
-- Logs everything to setup/logs/
+Behavior additions:
+- If trtexec missing, try:
+  1) extract TensorRT tarball (if configured) and wire env
+  2) search common locations for trtexec; if found but not on PATH, add permanent PATH
+- Idempotent wiring: writes to /etc/profile.d if root, else appends to ~/.bashrc
+- All other behavior as before: download models, relocate local files, convert ONNX->TRT, logging.
 
 Usage:
     python3 setup/setup.py [--config setup/config.yaml] [--no-gpu-check] [--skip-convert]
-
-Make sure to add a .env file for private repo PAT (GITHUB_PAT) if cloning a private repo.
 """
 
 import os
@@ -29,7 +23,7 @@ import argparse
 import subprocess
 from pathlib import Path
 
-# --- try optional imports; we will auto-install if missing ---
+# --- optional deps auto-install handled below ---
 MISSING = []
 try:
     import requests
@@ -55,8 +49,8 @@ def log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[setup {ts}] {msg}")
 
+# ------------------ subprocess helpers ------------------
 def run_cmd(cmd, timeout=None, check=False, env=None, cwd=None):
-    """Run command and capture output."""
     if isinstance(cmd, (list, tuple)):
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, env=env, cwd=cwd)
     else:
@@ -66,7 +60,6 @@ def run_cmd(cmd, timeout=None, check=False, env=None, cwd=None):
     return proc
 
 def run_cmd_stream(cmd, cwd=None, env=None, timeout=None):
-    """Run command and stream stdout/stderr to console and a timestamped log file."""
     if isinstance(cmd, (list, tuple)):
         cmd_list = cmd
     else:
@@ -89,8 +82,8 @@ def run_cmd_stream(cmd, cwd=None, env=None, timeout=None):
             raise
     return proc.returncode, "".join(lines)
 
+# ------------------ utilities ------------------
 def auto_install_python_pkgs():
-    """If optional packages are missing, attempt pip install them."""
     if not MISSING:
         return
     log(f"Missing python packages detected: {MISSING}. Attempting to pip install...")
@@ -132,7 +125,6 @@ def download_file(url, out_path, chunk_size=1 << 20):
     log(f"Downloaded {out_path} ({downloaded} bytes) in {time.time() - start:.1f}s")
 
 def file_move_or_copy(src, dst):
-    """Move src->dst if possible, else copy. Idempotent (skips if dst exists)."""
     src = Path(src)
     dst = Path(dst)
     ensure_dir(dst.parent)
@@ -149,9 +141,10 @@ def file_move_or_copy(src, dst):
 
 def load_config(cfg_path):
     with open(cfg_path, "r") as f:
-        return yaml.safe_load(f)
+        import yaml as _yaml
+        return _yaml.safe_load(f)
 
-# --- system checks ---
+# ------------------ system checks ------------------
 def check_gpu(require_gpu=True):
     if not require_gpu:
         log("GPU not required by config.")
@@ -188,8 +181,9 @@ def check_trtexec(trtexec_cmd="trtexec"):
     log("trtexec not found in PATH.")
     return False
 
-# --- TensorRT tarball extraction & wiring ---
-def wire_tensorrt_env(install_dir: Path):
+# ------------------ TensorRT install/wiring ------------------
+def wire_tensorrt_env_root(install_dir: Path):
+    """Write /etc/profile.d and /etc/ld.so.conf.d (requires root)."""
     binpath = str(install_dir / "bin")
     libpath = str(install_dir / "lib")
     profile = "/etc/profile.d/tensorrt.sh"
@@ -209,13 +203,44 @@ def wire_tensorrt_env(install_dir: Path):
             f.write(libpath + "\n")
         log("Running ldconfig...")
         run_cmd(["ldconfig"])
-        log("TensorRT environment wired (profile + ld).")
+        log("Wired TensorRT env in /etc (root).")
         return True
-    except PermissionError:
-        log(f"Permission error while writing {profile} or {ldconf}. Run the script as root or create these files manually with:\n{content}")
-        return False
     except Exception as e:
-        log(f"Failed to wire env: {e}")
+        log(f"Failed to wire root env: {e}")
+        return False
+
+def wire_tensorrt_env_user(install_dir: Path):
+    """Append exports to ~/.bashrc if not present (idempotent)."""
+    binpath = str(install_dir / "bin")
+    libpath = str(install_dir / "lib")
+    bashrc = Path.home() / ".bashrc"
+    export_lines = [
+        f'export TENSORRT_ROOT="{install_dir}"',
+        f'export LD_LIBRARY_PATH="{libpath}:${{LD_LIBRARY_PATH:-}}"',
+        f'export PATH="{binpath}:${{PATH:-}}"',
+    ]
+    try:
+        content = ""
+        if bashrc.exists():
+            content = bashrc.read_text()
+        else:
+            bashrc.parent.mkdir(parents=True, exist_ok=True)
+            bashrc.write_text("")
+            content = ""
+        changed = False
+        for line in export_lines:
+            if line not in content:
+                with open(bashrc, "a") as f:
+                    f.write("\n# Added by setup/setup.py\n")
+                    f.write(line + "\n")
+                changed = True
+        if changed:
+            log(f"Appended TensorRT env to {bashrc}. Source it or open a new shell to pick it up.")
+        else:
+            log(f"TensorRT env already present in {bashrc}.")
+        return True
+    except Exception as e:
+        log(f"Failed to write user bashrc: {e}")
         return False
 
 def extract_tensorrt_tarball(tarball: Path, install_dir: Path):
@@ -238,31 +263,49 @@ def extract_tensorrt_tarball(tarball: Path, install_dir: Path):
                 tar.extract(m, path=tmp)
                 pbar.update(1)
             pbar.close()
-        # move folder into install_dir
         entries = [p for p in tmp.iterdir() if p.exists()]
-        if len(entries) == 1 and entries[0].is_dir():
-            src = entries[0]
-        else:
-            src = tmp
+        src = entries[0] if len(entries) == 1 and entries[0].is_dir() else tmp
         if install_dir.exists():
             shutil.rmtree(install_dir)
         shutil.move(str(src), str(install_dir))
-        if tmp.exists():
-            try:
-                shutil.rmtree(tmp)
-            except Exception:
-                pass
+        try:
+            shutil.rmtree(tmp)
+        except Exception:
+            pass
         log(f"TensorRT extracted to {install_dir}")
         return True
     except Exception as e:
         log(f"Failed to extract tarball: {e}")
         return False
 
-# --- models handling and conversion ---
+def find_trtexec_in_paths(search_roots=None):
+    """Search for any 'trtexec' binary under common locations; return path if found."""
+    if search_roots is None:
+        search_roots = [Path("/workspace"), Path.cwd(), Path("/usr"), Path("/opt"), Path("/usr/local")]
+    for root in search_roots:
+        if not root.exists():
+            continue
+        # use rglob but limit depth to avoid long searches
+        try:
+            for p in root.rglob("trtexec"):
+                if p.is_file() and os.access(p, os.X_OK):
+                    return p.resolve()
+        except Exception:
+            continue
+    return None
+
+def add_trtexec_to_path(install_dir: Path):
+    """Try to add install_dir/bin to PATH permanently (root or user)."""
+    if os.geteuid() == 0:
+        ok = wire_tensorrt_env_root(install_dir)
+        if ok:
+            return True
+    # fallback to user .bashrc
+    ok = wire_tensorrt_env_user(install_dir)
+    return ok
+
+# ------------------ model handling & conversion (unchanged logic) ------------------
 def relocate_local_models(cfg):
-    """
-    Find any .onnx/.trt in repo root, /workspace, or PWD and move them into onnx_dir/trt_dir.
-    """
     onnx_dir = Path(cfg["paths"]["onnx_dir"])
     trt_dir = Path(cfg["paths"]["trt_dir"])
     ensure_dir(onnx_dir); ensure_dir(trt_dir)
@@ -287,10 +330,7 @@ def ensure_models(cfg):
     trt_dir = Path(paths["trt_dir"])
     models_dir = Path(paths["models_dir"])
     ensure_dir(onnx_dir); ensure_dir(trt_dir); ensure_dir(models_dir)
-
-    # relocate local files first
     relocate_local_models(cfg)
-
     for m in cfg.get("models", []):
         name = m.get("name")
         typ = m.get("type")
@@ -321,7 +361,6 @@ def ensure_models(cfg):
             log(f"Unknown model type {typ} for {name}; skipping.")
 
 def normalize_trtexec_args(args):
-    """Map older --workspace/--workspaceSize into memPoolSize if necessary."""
     if not args:
         return ""
     if "--memPoolSize" in args:
@@ -330,13 +369,8 @@ def normalize_trtexec_args(args):
     m = re.search(r"--workspace(?:Size)?(?:=|\s+)(\d+)", args)
     if m:
         val = int(m.group(1))
-        if val >= 1024 and val % 1024 == 0:
-            # user gave MB maybe; use M
-            args = re.sub(r"--workspace(?:Size)?(?:=|\s+)\d+", "", args)
-            return f"{args} --memPoolSize=workspace:{val}M"
-        else:
-            args = re.sub(r"--workspace(?:Size)?(?:=|\s+)\d+", "", args)
-            return f"{args} --memPoolSize=workspace:{val}M"
+        args = re.sub(r"--workspace(?:Size)?(?:=|\s+)\d+", "", args)
+        return f"{args} --memPoolSize=workspace:{val}M"
     return args
 
 def convert_models(cfg):
@@ -397,7 +431,7 @@ def print_summary(cfg):
             p = Path(paths["models_dir"]) / m.get("filename")
             log(f"{nm}: file={'OK' if p.exists() else 'MISSING'}")
 
-# --- main ---
+# ------------------ main ------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="setup/config.yaml")
@@ -408,7 +442,7 @@ def main():
     # auto-install missing python packages
     auto_install_python_pkgs()
 
-    # now safe to import dotenv/requests/tqdm/yaml
+    # safe to import dotenv now
     from dotenv import load_dotenv
     load_dotenv()
 
@@ -418,7 +452,7 @@ def main():
         sys.exit(2)
     cfg = load_config(cfg_path)
 
-    # ensure paths
+    # ensure base paths
     for k in ("repo_dir","models_dir","onnx_dir","trt_dir"):
         ensure_dir(cfg["paths"][k])
 
@@ -426,32 +460,64 @@ def main():
     if not args.no_gpu_check and cfg.get("system", {}).get("require_gpu", True):
         ok = check_gpu(True)
         if not ok:
-            log("GPU check failed. Re-run with --no-gpu-check if you want to continue without GPU.")
+            log("GPU check failed. Re-run with --no-gpu-check to bypass.")
             sys.exit(3)
-    # optional nvcc check
     check_nvcc(cfg.get("system", {}).get("cuda_version"))
 
-    # ensure trtexec or install tensorrt from tarball
-    if not check_trtexec(cfg.get("system", {}).get("trtexec_cmd","trtexec")):
+    # trtexec availability: if missing try extraction, else search and wire
+    trtexec_cmd = cfg.get("system", {}).get("trtexec_cmd", "trtexec")
+    if not check_trtexec(trtexec_cmd):
+        # 1) if tarball configured try extract
         tarball = cfg.get("system", {}).get("tensorrt_tarball")
         install_dir = Path(cfg.get("system", {}).get("tensorrt_install_dir", "/workspace/tensorrt"))
+        extracted = False
         if tarball:
             tarball = Path(tarball)
-            ok = extract_tensorrt_tarball(tarball, install_dir)
-            if ok:
-                # wire env (may require root)
-                wired = wire_tensorrt_env(install_dir)
-                if not wired:
-                    log("Failed to write profile/ld files (permission denied?). You can manually source the following env in your session:")
-                    log(f'export TENSORRT_ROOT="{install_dir}"')
-                    log(f'export LD_LIBRARY_PATH="{install_dir}/lib:${{LD_LIBRARY_PATH:-}}"')
-                    log(f'export PATH="{install_dir}/bin:${{PATH:-}}"')
+            if tarball.exists():
+                ok = extract_tensorrt_tarball(tarball, install_dir)
+                if ok:
+                    # try to wire env (prefer root wiring if root)
+                    if os.geteuid() == 0:
+                        wired = wire_tensorrt_env_root(install_dir)
+                        if not wired:
+                            log("root wiring failed; will fallback to user bashrc wiring.")
+                            wire_tensorrt_env_user(install_dir)
+                    else:
+                        wire_tensorrt_env_user(install_dir)
+                    extracted = True
+                    # update PATH for current process so next check_trtexec sees it
+                    os.environ["PATH"] = str(install_dir / "bin") + ":" + os.environ.get("PATH","")
+                    os.environ["LD_LIBRARY_PATH"] = str(install_dir / "lib") + ":" + os.environ.get("LD_LIBRARY_PATH","")
             else:
-                log("TensorRT extraction failed or not configured. Conversion step will be skipped unless trtexec is available.")
-        else:
-            log("No TensorRT tarball configured and trtexec not found. You must install TensorRT manually to convert models.")
+                log(f"Configured TensorRT tarball not found: {tarball}")
 
-    # clone/pull repo if configured (handles private repo via GITHUB_PAT in .env)
+        # 2) if not extracted, search common locations for trtexec
+        if not extracted:
+            found = find_trtexec_in_paths()
+            if found:
+                log(f"Found existing trtexec at: {found}")
+                binpath = Path(found).parent
+                install_guess = binpath.parent
+                # If binary not in PATH, wire it (root or user)
+                if str(binpath) not in os.environ.get("PATH",""):
+                    ok = add_trtexec_to_path(install_guess)
+                    if ok:
+                        # also update current env
+                        os.environ["PATH"] = str(binpath) + ":" + os.environ.get("PATH","")
+                        libp = str(install_guess / "lib")
+                        os.environ["LD_LIBRARY_PATH"] = libp + ":" + os.environ.get("LD_LIBRARY_PATH","")
+                        log("Wired found TensorRT install into PATH/LD_LIBRARY_PATH.")
+                    else:
+                        log("Failed to wire found trtexec into PATH automatically. Please add it manually.")
+                else:
+                    log("Found trtexec already on PATH.")
+            else:
+                log("No trtexec found in system locations and no tarball configured. Conversions will be skipped unless trtexec is later installed.")
+
+    else:
+        log("trtexec already available in PATH.")
+
+    # clone/pull repo if configured
     if cfg.get("actions", {}).get("run_clone_repo", True):
         repo_cfg = cfg.get("git", {})
         repo_url = repo_cfg.get("repo")

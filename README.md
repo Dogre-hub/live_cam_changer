@@ -7,7 +7,6 @@ python3 setup/setup.py  --config setup/config.yaml
 
 
 
-
 check
 project-root/
 ├── setup/
