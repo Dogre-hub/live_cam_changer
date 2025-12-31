@@ -10,6 +10,9 @@ models/
 *.env
 .env
 EOF
+.md
+*.md
+
 
 git add .gitignore
 git commit -m "Ignore model artifacts"

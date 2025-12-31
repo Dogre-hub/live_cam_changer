@@ -2,320 +2,498 @@
 """
 setup/setup.py
 
-Idempotent setup script for GPU instance.
+Enhanced idempotent installer for live_cam_changer repo.
 
-What it does:
-- Reads setup/config.yaml
-- Checks GPU (nvidia-smi) if enabled
-- Optionally verifies trtexec is available
-- Clones or pulls git repo
-- Downloads models (ONNX / .pth) if missing
-- Converts ONNX -> TensorRT (.trt) using trtexec if requested
-- Leaves everything under configured paths:
-    models_dir/onnx/..., models_dir/tensorrt/...
-- Safe to re-run (skips work already done)
+- Reads .env and setup/config.yaml
+- Installs missing python packages (requests, tqdm, pyyaml, python-dotenv) automatically
+- Checks GPU (nvidia-smi) and optional CUDA version
+- Installs/unpacks TensorRT from a local tarball (if configured) and wires environment
+- Moves local .onnx/.trt into models/onnx and models/trt (idempotent)
+- Downloads ONNX / PyTorch models (if urls provided)
+- Converts ONNX -> TensorRT using trtexec (streams logs)
+- Logs everything to setup/logs/
 
-Run manually on the GPU machine:
-    python3 setup/setup.py
+Usage:
+    python3 setup/setup.py [--config setup/config.yaml] [--no-gpu-check] [--skip-convert]
 
-Dependencies:
-    pip3 install pyyaml requests
+Make sure to add a .env file for private repo PAT (GITHUB_PAT) if cloning a private repo.
 """
 
 import os
 import sys
-import yaml
-import subprocess
-import argparse
-import shutil
 import time
+import tarfile
+import stat
+import shutil
+import argparse
+import subprocess
 from pathlib import Path
-from urllib.parse import urlparse
-from pathlib import Path
-from dotenv import load_dotenv
 
-env_path = Path('.') / '.env'
-load_dotenv(dotenv_path=env_path)
-
+# --- try optional imports; we will auto-install if missing ---
+MISSING = []
 try:
     import requests
 except Exception:
-    print("Missing dependency 'requests'. Please install: pip3 install requests")
-    sys.exit(1)
+    MISSING.append("requests")
+try:
+    from tqdm import tqdm
+except Exception:
+    MISSING.append("tqdm")
+try:
+    import yaml
+except Exception:
+    MISSING.append("pyyaml")
+try:
+    from dotenv import load_dotenv
+except Exception:
+    MISSING.append("python-dotenv")
 
-# ---------------------------
-# Helpers
-# ---------------------------
+LOG_DIR = Path("setup/logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 def log(msg):
-    print(f"[setup] {msg}")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[setup {ts}] {msg}")
 
-def run_cmd(cmd, timeout=None, check=False):
-    """Run shell command. cmd may be list or string."""
+def run_cmd(cmd, timeout=None, check=False, env=None, cwd=None):
+    """Run command and capture output."""
     if isinstance(cmd, (list, tuple)):
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, env=env, cwd=cwd)
     else:
-        proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, env=env, cwd=cwd)
     if proc.returncode != 0 and check:
         raise RuntimeError(f"Command failed: {cmd}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
     return proc
 
-def ensure_dir(path):
-    Path(path).mkdir(parents=True, exist_ok=True)
+def run_cmd_stream(cmd, cwd=None, env=None, timeout=None):
+    """Run command and stream stdout/stderr to console and a timestamped log file."""
+    if isinstance(cmd, (list, tuple)):
+        cmd_list = cmd
+    else:
+        cmd_list = ["bash", "-lc", cmd]
+    logfile = LOG_DIR / f"run-{int(time.time())}.log"
+    log(f"Running: {' '.join(cmd_list) if isinstance(cmd_list, list) else cmd_list}")
+    with open(logfile, "w") as lf:
+        proc = subprocess.Popen(cmd_list, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True, bufsize=1)
+        lines = []
+        try:
+            for line in proc.stdout:
+                lf.write(line)
+                lf.flush()
+                lines.append(line)
+                print(line.rstrip())
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            log(f"Command timeout. See log: {logfile}")
+            raise
+    return proc.returncode, "".join(lines)
+
+def auto_install_python_pkgs():
+    """If optional packages are missing, attempt pip install them."""
+    if not MISSING:
+        return
+    log(f"Missing python packages detected: {MISSING}. Attempting to pip install...")
+    pkg_str = " ".join(MISSING)
+    proc = run_cmd(f"pip3 install {pkg_str}")
+    if proc.returncode != 0:
+        log(f"pip install failed: {proc.stderr}")
+        raise RuntimeError("Please install required Python packages and re-run.")
+
+def ensure_dir(p):
+    Path(p).mkdir(parents=True, exist_ok=True)
 
 def download_file(url, out_path, chunk_size=1 << 20):
-    """Download with resume fallback. Overwrites partially only on success."""
     out_path = Path(out_path)
     tmp = out_path.with_suffix(out_path.suffix + ".part")
     log(f"Downloading: {url} -> {out_path}")
-    session = requests.Session()
-    with session.get(url, stream=True, timeout=60) as resp:
+    sess = requests.Session()
+    with sess.get(url, stream=True, timeout=60) as resp:
         resp.raise_for_status()
         total = resp.headers.get("Content-Length")
         if total:
             total = int(total)
-            log(f"Content-Length: {total} bytes")
         with open(tmp, "wb") as f:
+            if total:
+                pbar = tqdm(total=total, unit="B", unit_scale=True, desc=out_path.name)
+            else:
+                pbar = None
             downloaded = 0
             start = time.time()
             for chunk in resp.iter_content(chunk_size=chunk_size):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
-            f.flush()
+                    if pbar:
+                        pbar.update(len(chunk))
+            if pbar:
+                pbar.close()
     tmp.replace(out_path)
-    elapsed = time.time() - start
-    log(f"Downloaded {out_path} ({downloaded} bytes) in {elapsed:.1f}s")
+    log(f"Downloaded {out_path} ({downloaded} bytes) in {time.time() - start:.1f}s")
 
-# ---------------------------
-# Core logic
-# ---------------------------
-def load_config(config_path):
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
-    return cfg
+def file_move_or_copy(src, dst):
+    """Move src->dst if possible, else copy. Idempotent (skips if dst exists)."""
+    src = Path(src)
+    dst = Path(dst)
+    ensure_dir(dst.parent)
+    if not src.exists():
+        return False, f"src-missing:{src}"
+    if dst.exists():
+        return True, f"exists:{dst}"
+    try:
+        src.rename(dst)
+        return True, f"moved:{dst}"
+    except Exception:
+        shutil.copy2(src, dst)
+        return True, f"copied:{dst}"
 
-def check_gpu(cfg):
-    if not cfg.get("system", {}).get("require_gpu", False):
+def load_config(cfg_path):
+    with open(cfg_path, "r") as f:
+        return yaml.safe_load(f)
+
+# --- system checks ---
+def check_gpu(require_gpu=True):
+    if not require_gpu:
         log("GPU not required by config.")
         return True
-    cmd = cfg.get("system", {}).get("gpu_check_cmd", "nvidia-smi")
     try:
-        proc = run_cmd([cmd], check=True)
-        log(f"GPU check OK. nvidia-smi output (short):\n{proc.stdout.splitlines()[:10]}")
+        proc = run_cmd(["nvidia-smi"])
+        log("nvidia-smi OK.")
         return True
     except Exception as e:
-        log(f"GPU check failed: {e}")
+        log(f"nvidia-smi failed: {e}")
         return False
 
-def check_trtexec(cfg):
-    if not cfg.get("actions", {}).get("verify_trtexec", True):
-        log("Skipping trtexec verification (config).")
+def check_nvcc(cuda_version=None):
+    if not cuda_version:
         return True
-    trtexec = cfg.get("system", {}).get("trtexec_cmd", "trtexec")
-    proc = shutil.which(trtexec)
-    if proc:
-        log(f"Found trtexec at: {proc}")
-        return True
-    else:
-        log("trtexec not found in PATH. You must install TensorRT or add trtexec to PATH.")
+    try:
+        proc = run_cmd(["nvcc", "--version"])
+        out = proc.stdout + proc.stderr
+        if cuda_version in out:
+            log(f"nvcc reports expected CUDA version {cuda_version}.")
+            return True
+        else:
+            log(f"nvcc output did not show expected version {cuda_version}. nvcc output sample:\n{out.splitlines()[:6]}")
+            return False
+    except Exception:
+        log("nvcc not found or error running nvcc --version.")
         return False
 
-def git_clone_or_pull(repo_url, branch, dest):
-    dest = Path(dest)
-    if dest.exists() and (dest / ".git").exists():
-        log(f"Repo exists at {dest}, pulling latest from branch '{branch}'")
-        try:
-            proc = run_cmd(["git", "-C", str(dest), "fetch"], check=True)
-            proc = run_cmd(["git", "-C", str(dest), "checkout", branch], check=True)
-            proc = run_cmd(["git", "-C", str(dest), "pull", "origin", branch], check=True)
-            log("Git pull completed.")
-        except Exception as e:
-            log(f"Git pull failed: {e}")
-            raise
-    else:
-        log(f"Cloning repo {repo_url} -> {dest}")
-        ensure_dir(dest.parent)
-        try:
-            proc = run_cmd(["git", "clone", "--branch", branch, repo_url, str(dest)], check=True)
-            log("Git clone completed.")
-        except Exception as e:
-            log(f"Git clone failed: {e}")
-            raise
+def check_trtexec(trtexec_cmd="trtexec"):
+    p = shutil.which(trtexec_cmd)
+    if p:
+        log(f"Found trtexec: {p}")
+        return True
+    log("trtexec not found in PATH.")
+    return False
+
+# --- TensorRT tarball extraction & wiring ---
+def wire_tensorrt_env(install_dir: Path):
+    binpath = str(install_dir / "bin")
+    libpath = str(install_dir / "lib")
+    profile = "/etc/profile.d/tensorrt.sh"
+    ldconf = "/etc/ld.so.conf.d/tensorrt.conf"
+    content = (
+        f'export TENSORRT_ROOT="{install_dir}"\n'
+        f'export LD_LIBRARY_PATH="{libpath}:${{LD_LIBRARY_PATH:-}}"\n'
+        f'export PATH="{binpath}:${{PATH:-}}"\n'
+    )
+    try:
+        log(f"Writing {profile}")
+        with open(profile, "w") as f:
+            f.write(content)
+        os.chmod(profile, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+        log(f"Writing {ldconf}")
+        with open(ldconf, "w") as f:
+            f.write(libpath + "\n")
+        log("Running ldconfig...")
+        run_cmd(["ldconfig"])
+        log("TensorRT environment wired (profile + ld).")
+        return True
+    except PermissionError:
+        log(f"Permission error while writing {profile} or {ldconf}. Run the script as root or create these files manually with:\n{content}")
+        return False
+    except Exception as e:
+        log(f"Failed to wire env: {e}")
+        return False
+
+def extract_tensorrt_tarball(tarball: Path, install_dir: Path):
+    if not tarball.exists():
+        log(f"TensorRT tarball not found: {tarball}")
+        return False
+    if (install_dir / "bin" / "trtexec").exists():
+        log(f"TensorRT already extracted at {install_dir}")
+        return True
+    tmp = install_dir.parent / (install_dir.name + ".partial")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    ensure_dir(tmp)
+    log(f"Extracting TensorRT tarball {tarball} -> {tmp}")
+    try:
+        with tarfile.open(tarball, "r:gz") as tar:
+            members = tar.getmembers()
+            pbar = tqdm(total=len(members), desc="extracting TensorRT")
+            for m in members:
+                tar.extract(m, path=tmp)
+                pbar.update(1)
+            pbar.close()
+        # move folder into install_dir
+        entries = [p for p in tmp.iterdir() if p.exists()]
+        if len(entries) == 1 and entries[0].is_dir():
+            src = entries[0]
+        else:
+            src = tmp
+        if install_dir.exists():
+            shutil.rmtree(install_dir)
+        shutil.move(str(src), str(install_dir))
+        if tmp.exists():
+            try:
+                shutil.rmtree(tmp)
+            except Exception:
+                pass
+        log(f"TensorRT extracted to {install_dir}")
+        return True
+    except Exception as e:
+        log(f"Failed to extract tarball: {e}")
+        return False
+
+# --- models handling and conversion ---
+def relocate_local_models(cfg):
+    """
+    Find any .onnx/.trt in repo root, /workspace, or PWD and move them into onnx_dir/trt_dir.
+    """
+    onnx_dir = Path(cfg["paths"]["onnx_dir"])
+    trt_dir = Path(cfg["paths"]["trt_dir"])
+    ensure_dir(onnx_dir); ensure_dir(trt_dir)
+    search_roots = [Path.cwd(), Path("/workspace"), Path(os.getenv("PWD", "."))]
+    moved = []
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for f in list(root.glob("*.onnx")) + list(root.glob("*.trt")):
+            dst = onnx_dir / f.name if f.suffix == ".onnx" else trt_dir / f.name
+            if dst.exists():
+                continue
+            ok,info = file_move_or_copy(f, dst)
+            if ok:
+                moved.append((f, dst, info))
+                log(f"Relocated local model: {f} -> {dst} ({info})")
+    return moved
 
 def ensure_models(cfg):
     paths = cfg["paths"]
-    models_dir = Path(paths["models_dir"])
     onnx_dir = Path(paths["onnx_dir"])
     trt_dir = Path(paths["trt_dir"])
-    ensure_dir(models_dir)
-    ensure_dir(onnx_dir)
-    ensure_dir(trt_dir)
+    models_dir = Path(paths["models_dir"])
+    ensure_dir(onnx_dir); ensure_dir(trt_dir); ensure_dir(models_dir)
+
+    # relocate local files first
+    relocate_local_models(cfg)
 
     for m in cfg.get("models", []):
-        mname = m.get("name")
-        mtype = m.get("type")
-        url = m.get("url", "").strip()
+        name = m.get("name")
+        typ = m.get("type")
+        url = (m.get("url") or "").strip()
         filename = m.get("filename")
         if not filename:
-            log(f"Model '{mname}' has no filename in config, skipping.")
+            log(f"Model {name} missing 'filename' in config; skipping.")
             continue
-
-        if mtype == "onnx":
-            out_path = onnx_dir / filename
-            if out_path.exists():
-                log(f"ONNX model exists: {out_path} (skipping download)")
-            else:
-                if not url:
-                    log(f"No URL for ONNX model '{mname}', skipping download.")
-                else:
-                    download_file(url, out_path)
-        elif mtype in ("pth", "pt"):
-            out_path = models_dir / filename
-            if out_path.exists():
-                log(f"PyTorch model exists: {out_path} (skipping download)")
-            else:
-                if not url:
-                    log(f"No URL for PyTorch model '{mname}', skipping download.")
-                else:
-                    download_file(url, out_path)
+        if typ == "onnx":
+            out = onnx_dir / filename
+            if out.exists():
+                log(f"ONNX exists: {out}")
+                continue
+            if not url:
+                log(f"No URL configured for ONNX model {name} and file missing; skipping.")
+                continue
+            download_file(url, out)
+        elif typ in ("pth","pt"):
+            out = models_dir / filename
+            if out.exists():
+                log(f"PyTorch model exists: {out}")
+                continue
+            if not url:
+                log(f"No URL configured for PyTorch model {name} and file missing; skipping.")
+                continue
+            download_file(url, out)
         else:
-            log(f"Unknown model type '{mtype}' for model '{mname}', skipping.")
+            log(f"Unknown model type {typ} for {name}; skipping.")
 
-def convert_models_to_trt(cfg):
-    paths = cfg["paths"]
-    onnx_dir = Path(paths["onnx_dir"])
-    trt_dir = Path(paths["trt_dir"])
+def normalize_trtexec_args(args):
+    """Map older --workspace/--workspaceSize into memPoolSize if necessary."""
+    if not args:
+        return ""
+    if "--memPoolSize" in args:
+        return args
+    import re
+    m = re.search(r"--workspace(?:Size)?(?:=|\s+)(\d+)", args)
+    if m:
+        val = int(m.group(1))
+        if val >= 1024 and val % 1024 == 0:
+            # user gave MB maybe; use M
+            args = re.sub(r"--workspace(?:Size)?(?:=|\s+)\d+", "", args)
+            return f"{args} --memPoolSize=workspace:{val}M"
+        else:
+            args = re.sub(r"--workspace(?:Size)?(?:=|\s+)\d+", "", args)
+            return f"{args} --memPoolSize=workspace:{val}M"
+    return args
+
+def convert_models(cfg):
+    onnx_dir = Path(cfg["paths"]["onnx_dir"])
+    trt_dir = Path(cfg["paths"]["trt_dir"])
     trtexec = cfg.get("system", {}).get("trtexec_cmd", "trtexec")
     timeout = cfg.get("system", {}).get("trtexec_timeout_sec", 900)
-
     for m in cfg.get("models", []):
         if not m.get("convert_to_trt", False):
             continue
         if m.get("type") != "onnx":
-            log(f"Model {m.get('name')} marked convert_to_trt but isn't ONNX type; skipping.")
+            log(f"{m.get('name')} marked for convert but not ONNX; skipping.")
             continue
-
         onnx_file = onnx_dir / m["filename"]
         trt_file = trt_dir / m["trt_filename"]
-
         if not onnx_file.exists():
-            log(f"ONNX file missing for {m['name']}: {onnx_file} (cannot convert).")
+            log(f"Missing ONNX for {m.get('name')}: {onnx_file}")
             continue
-
         if trt_file.exists():
-            log(f"TRT engine already exists: {trt_file} (skipping conversion).")
+            log(f"TRT already exists: {trt_file} (skipping conversion)")
             continue
-
-        # Build trtexec command
-        extra_args = m.get("trtexec_args", "")
-        cmd = f"{trtexec} --onnx={onnx_file} --saveEngine={trt_file} {extra_args}"
-        log(f"Converting ONNX -> TensorRT for {m['name']}:")
-        log(f"  command: {cmd}")
+        args = m.get("trtexec_args", "")
+        args = normalize_trtexec_args(args)
+        cmd = f"{trtexec} --onnx={onnx_file} --saveEngine={trt_file} {args}"
+        log(f"Converting {m.get('name')} -> TRT. Command:\n  {cmd}")
         try:
-            proc = run_cmd(cmd, timeout=timeout)
-            if proc.returncode == 0:
-                log(f"Conversion succeeded for {m['name']}, saved: {trt_file}")
+            rc, out = run_cmd_stream(cmd, timeout=timeout)
+            if rc == 0:
+                log(f"Conversion succeeded for {m.get('name')}: {trt_file}")
             else:
-                log(f"Conversion returned non-zero code ({proc.returncode}). stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
-                raise RuntimeError("trtexec failed")
+                log(f"Conversion failed (rc={rc}). See setup/logs for details.")
+                if trt_file.exists():
+                    try:
+                        trt_file.unlink()
+                        log(f"Removed partial engine {trt_file}")
+                    except Exception:
+                        pass
+                raise RuntimeError(f"trtexec failed for {m.get('name')}")
         except Exception as e:
-            log(f"Conversion failed for {m['name']}: {e}")
-            # If conversion failed, ensure partial output is removed
-            if trt_file.exists():
-                try:
-                    trt_file.unlink()
-                    log(f"Removed partial trt file: {trt_file}")
-                except Exception:
-                    pass
+            log(f"Conversion raised exception: {e}")
             raise
 
 def print_summary(cfg):
     paths = cfg["paths"]
     log("SETUP SUMMARY")
-    log(f"Repo dir: {paths['repo_dir']}")
-    log(f"Models dir: {paths['models_dir']}")
-    log(f"ONNX dir: {paths['onnx_dir']}")
-    log(f"TensorRT dir: {paths['trt_dir']}")
+    log(f"repo_dir: {paths['repo_dir']}")
+    log(f"models_dir: {paths['models_dir']}")
+    log(f"onnx_dir: {paths['onnx_dir']}")
+    log(f"trt_dir: {paths['trt_dir']}")
     for m in cfg.get("models", []):
-        name = m.get("name")
-        mtype = m.get("type")
-        if mtype == "onnx":
-            onnx_path = Path(paths["onnx_dir"]) / m.get("filename")
-            trt_path = Path(paths["trt_dir"]) / m.get("trt_filename") if m.get("trt_filename") else None
-            log(f"Model {name}: onnx={'exists' if onnx_path.exists() else 'MISSING'} trt={'exists' if trt_path and trt_path.exists() else 'MISSING' if m.get('convert_to_trt',False) else 'N/A'}")
+        nm = m.get("name")
+        typ = m.get("type")
+        if typ == "onnx":
+            onnxp = Path(paths["onnx_dir"]) / m.get("filename")
+            trtp = Path(paths["trt_dir"]) / m.get("trt_filename") if m.get("trt_filename") else None
+            log(f"{nm}: onnx={'OK' if onnxp.exists() else 'MISSING'} trt={'OK' if trtp and trtp.exists() else 'MISSING' if m.get('convert_to_trt') else 'N/A'}")
         else:
-            model_path = Path(paths["models_dir"]) / m.get("filename")
-            log(f"Model {name}: file={'exists' if model_path.exists() else 'MISSING'}")
+            p = Path(paths["models_dir"]) / m.get("filename")
+            log(f"{nm}: file={'OK' if p.exists() else 'MISSING'}")
 
-# ---------------------------
-# Main
-# ---------------------------
+# --- main ---
 def main():
-    parser = argparse.ArgumentParser(description="Idempotent GPU instance setup script")
-    parser.add_argument("--config", type=str, default="setup/config.yaml", help="Path to YAML config")
-    parser.add_argument("--no-gpu-check", action="store_true", help="Skip GPU check")
-    parser.add_argument("--skip-convert", action="store_true", help="Skip ONNX->TensorRT conversion step")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="setup/config.yaml")
+    parser.add_argument("--no-gpu-check", action="store_true")
+    parser.add_argument("--skip-convert", action="store_true")
     args = parser.parse_args()
+
+    # auto-install missing python packages
+    auto_install_python_pkgs()
+
+    # now safe to import dotenv/requests/tqdm/yaml
+    from dotenv import load_dotenv
+    load_dotenv()
 
     cfg_path = Path(args.config)
     if not cfg_path.exists():
-        print(f"Config file not found: {cfg_path}")
+        log(f"Config not found: {cfg_path}")
         sys.exit(2)
-
     cfg = load_config(cfg_path)
 
-    # Ensure directories are present
-    ensure_dir(cfg["paths"]["models_dir"])
-    ensure_dir(cfg["paths"]["onnx_dir"])
-    ensure_dir(cfg["paths"]["trt_dir"])
-    ensure_dir(cfg["paths"]["repo_dir"])
+    # ensure paths
+    for k in ("repo_dir","models_dir","onnx_dir","trt_dir"):
+        ensure_dir(cfg["paths"][k])
 
-    # 1) GPU check
-    if (not args.no_gpu_check) and cfg.get("system", {}).get("require_gpu", True):
-        ok = check_gpu(cfg)
+    # pre-checks
+    if not args.no_gpu_check and cfg.get("system", {}).get("require_gpu", True):
+        ok = check_gpu(True)
         if not ok:
-            log("GPU check failed. If you want to continue without GPU check, re-run with --no-gpu-check")
+            log("GPU check failed. Re-run with --no-gpu-check if you want to continue without GPU.")
             sys.exit(3)
+    # optional nvcc check
+    check_nvcc(cfg.get("system", {}).get("cuda_version"))
 
-    # 2) trtexec check (optional)
-    if cfg.get("actions", {}).get("verify_trtexec", True):
-        ok_trt = check_trtexec(cfg)
-        if not ok_trt:
-            log("Warning: trtexec not found. You will NOT be able to convert ONNX -> TensorRT until TensorRT is installed.")
-            # do not exit; user may still want to download models
+    # ensure trtexec or install tensorrt from tarball
+    if not check_trtexec(cfg.get("system", {}).get("trtexec_cmd","trtexec")):
+        tarball = cfg.get("system", {}).get("tensorrt_tarball")
+        install_dir = Path(cfg.get("system", {}).get("tensorrt_install_dir", "/workspace/tensorrt"))
+        if tarball:
+            tarball = Path(tarball)
+            ok = extract_tensorrt_tarball(tarball, install_dir)
+            if ok:
+                # wire env (may require root)
+                wired = wire_tensorrt_env(install_dir)
+                if not wired:
+                    log("Failed to write profile/ld files (permission denied?). You can manually source the following env in your session:")
+                    log(f'export TENSORRT_ROOT="{install_dir}"')
+                    log(f'export LD_LIBRARY_PATH="{install_dir}/lib:${{LD_LIBRARY_PATH:-}}"')
+                    log(f'export PATH="{install_dir}/bin:${{PATH:-}}"')
+            else:
+                log("TensorRT extraction failed or not configured. Conversion step will be skipped unless trtexec is available.")
+        else:
+            log("No TensorRT tarball configured and trtexec not found. You must install TensorRT manually to convert models.")
 
+    # clone/pull repo if configured (handles private repo via GITHUB_PAT in .env)
     if cfg.get("actions", {}).get("run_clone_repo", True):
         repo_cfg = cfg.get("git", {})
         repo_url = repo_cfg.get("repo")
-        branch = repo_cfg.get("branch", "main")
-        dest = cfg["paths"]["repo_dir"]
-
-        # Load PAT from environment
-        GITHUB_PAT = os.getenv("GITHUB_PAT")
-        if GITHUB_PAT and repo_url.startswith("https://github.com/"):
-            # Insert token into HTTPS URL
-            repo_url = repo_url.replace("https://", f"https://{GITHUB_PAT}@")
-            
+        branch = repo_cfg.get("branch","main")
+        dest = Path(cfg["paths"]["repo_dir"])
         if repo_url:
-            git_clone_or_pull(repo_url, branch, dest)
+            GITHUB_PAT = os.getenv("GITHUB_PAT")
+            if GITHUB_PAT and repo_url.startswith("https://github.com/"):
+                repo_url = repo_url.replace("https://", f"https://{GITHUB_PAT}@")
+            if dest.exists() and (dest / ".git").exists():
+                try:
+                    run_cmd(["git","-C",str(dest),"fetch"], check=True)
+                    run_cmd(["git","-C",str(dest),"checkout",branch], check=True)
+                    run_cmd(["git","-C",str(dest),"pull","origin",branch], check=True)
+                    log(f"Pulled repo {repo_url} -> {dest}")
+                except Exception as e:
+                    log(f"Git pull failed: {e}")
+            else:
+                try:
+                    ensure_dir(dest.parent)
+                    run_cmd(["git","clone","--branch",branch,repo_url,str(dest)], check=True)
+                    log(f"Cloned repo {repo_url} -> {dest}")
+                except Exception as e:
+                    log(f"Git clone failed: {e}")
         else:
-            log("No git repo URL provided in config; skipping clone/pull.")
+            log("No git repo URL configured; skipping clone/pull.")
 
+    # models: relocate local files and download missing ones
+    ensure_models(cfg)
 
-    # 4) Download models if missing
-    if cfg.get("actions", {}).get("run_download_models", True):
-        ensure_models(cfg)
-
-    # 5) Convert ONNX -> TensorRT (if requested and not skipped)
-    if (not args.skip_convert) and cfg.get("actions", {}).get("run_convert_trt", True):
-        # If trtexec missing, conversion will fail; we attempt anyway and bubble errors
-        convert_models_to_trt(cfg)
+    # convert models if trtexec exists and conversion enabled
+    if not args.skip_convert and cfg.get("actions", {}).get("run_convert_trt", True):
+        if not check_trtexec(cfg.get("system", {}).get("trtexec_cmd","trtexec")):
+            log("trtexec not available; skipping conversion step.")
+        else:
+            convert_models(cfg)
     else:
-        log("Skipping conversion step (skip flag or configured false).")
+        log("Skipping conversion step (skipped by flag or config).")
 
-    # 6) Final summary
+    # final summary
     print_summary(cfg)
-    log("Setup finished. If everything exists, the instance is ready for inference tests.")
+    log("Setup completed. Check setup/logs for command outputs and errors.")
 
 if __name__ == "__main__":
     main()

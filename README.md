@@ -3,6 +3,11 @@ change face in real time
 
 python3 setup/setup.py --no-gpu-check --skip-convert --config setup/config.yaml
 
+python3 setup/setup.py  --config setup/config.yaml
+
+
+
+
 check
 project-root/
 ├── setup/
