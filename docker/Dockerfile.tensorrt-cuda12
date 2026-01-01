@@ -1,0 +1,41 @@
+# Alternative Dockerfile using a newer TensorRT container with latest compatible versions
+# This container has better TensorRT 10.x support and CUDA 12.6
+
+FROM nvcr.io/nvidia/tensorrt:24.10-py3
+
+# Working directory
+WORKDIR /workspace
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Upgrade pip and install packages in optimized layers
+RUN python3 -m pip install --upgrade pip setuptools wheel && \
+    # Install PyTorch for CUDA 12.x
+    pip install --no-cache-dir \
+        torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/cu121 && \
+    # Install ONNXRuntime-GPU 1.20+ for TensorRT 10.4 support
+    pip install --no-cache-dir \
+        onnxruntime-gpu==1.20.0 \
+        onnx && \
+    # Install common ML/CV dependencies
+    pip install --no-cache-dir \
+        opencv-python \
+        scikit-image \
+        insightface \
+        numpy \
+        scipy && \
+    # Install Jupyter for development
+    pip install --no-cache-dir \
+        jupyterlab ipywidgets jupyter-server-proxy
+
+# Copy startup script
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+# Expose Jupyter port
+EXPOSE 8888
+
+# Start Jupyter
+CMD ["/start.sh"]
